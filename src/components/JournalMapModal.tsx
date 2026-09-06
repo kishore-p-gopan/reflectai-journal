@@ -49,7 +49,6 @@ export const JournalMapModal: React.FC<JournalMapModalProps> = ({
   const modalContainerRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<google.maps.Map | null>(null);
   const pickedMarkerRef = useRef<any>(null);
-  const geocoderRef = useRef<google.maps.Geocoder | null>(null);
   const entryMarkersRef = useRef<Map<string, any>>(new Map());
 
   const [mapError, setMapError] = useState<string | null>(null);
@@ -130,12 +129,9 @@ export const JournalMapModal: React.FC<JournalMapModalProps> = ({
     Promise.all([
       importLibrary('maps'),
       importLibrary('marker'),
-      importLibrary('geocoding'),
     ])
-      .then(async ([{ Map }, { AdvancedMarkerElement }, { Geocoder }]: any) => {
+      .then(async ([{ Map }, { AdvancedMarkerElement }]: any) => {
         if (!isMounted || !mapContainerRef.current) return;
-
-        geocoderRef.current = new Geocoder();
 
         // Determine initial center: selected entry, or first geotagged entry, or default
         let initialCenter = { lat: 37.7749, lng: -122.4194 };
@@ -217,18 +213,12 @@ export const JournalMapModal: React.FC<JournalMapModalProps> = ({
           setSearchFeedback(`Selected point (${lat}°, ${lng}°)`);
 
           // Reverse geocode to get formatted address
-          if (geocoderRef.current) {
-            try {
-              const res = await geocoderRef.current.geocode({ location: e.latLng });
-              if (res.results && res.results[0]) {
-                const address = res.results[0].formatted_address;
-                setPickedLocation({ lat, lng, address });
-                setSearchFeedback(`Selected: ${address}`);
-              }
-            } catch (revErr) {
-              console.warn('Reverse geocoding note:', revErr);
+          reverseGeocodeCoordinate(lat, lng).then((address) => {
+            if (address && isMounted) {
+              setPickedLocation((prev) => (prev ? { ...prev, address } : null));
+              setSearchFeedback(`Selected: ${address}`);
             }
-          }
+          });
 
           // Place / Update the picked target pin on the map
           if (pickedMarkerRef.current) {
@@ -338,58 +328,97 @@ export const JournalMapModal: React.FC<JournalMapModalProps> = ({
     window.addEventListener('pointerup', handlePointerUp);
   };
 
-  // Handle Location Search via Geocoding
+  // Resilient zero-billing reverse geocoder (via same-origin backend proxy)
+  const reverseGeocodeCoordinate = async (lat: number, lng: number): Promise<string | null> => {
+    try {
+      const resp = await fetch(`/api/geo/reverse?lat=${lat}&lng=${lng}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data?.address) {
+          return data.address;
+        }
+      }
+    } catch {
+      // Graceful fallback (coordinates will be displayed cleanly)
+    }
+    return `${lat}°, ${lng}°`;
+  };
+
+  // Resilient zero-billing forward geocoder (via same-origin backend proxy)
+  const forwardGeocodeSearch = async (query: string): Promise<{ lat: number; lng: number; address: string } | null> => {
+    const clean = query.trim();
+    if (!clean) return null;
+
+    try {
+      const resp = await fetch(`/api/geo/search?q=${encodeURIComponent(clean)}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data?.results && data.results.length > 0) {
+          const top = data.results[0];
+          return {
+            lat: top.lat,
+            lng: top.lng,
+            address: top.address || top.displayName,
+          };
+        }
+      }
+    } catch (err) {
+      console.warn('Location search error:', err);
+    }
+
+    return null;
+  };
+
+  // Handle Location Search
   const handleSearchLocation = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!searchQuery.trim()) return;
-
-    if (!geocoderRef.current || !mapInstanceRef.current) {
-      setSearchFeedback('Map service is still initializing. Please wait a moment.');
-      return;
-    }
 
     setIsSearching(true);
     setSearchFeedback(null);
 
     try {
-      const response = await geocoderRef.current.geocode({ address: searchQuery.trim() });
-      if (response.results && response.results.length > 0) {
-        const topResult = response.results[0];
-        const location = topResult.geometry.location;
-        const lat = Number(location.lat().toFixed(4));
-        const lng = Number(location.lng().toFixed(4));
-        const address = topResult.formatted_address;
+      const result = await forwardGeocodeSearch(searchQuery);
+      if (result) {
+        const { lat, lng, address } = result;
 
         setPickedLocation({ lat, lng, address });
         setSearchFeedback(`Found: ${address}`);
 
-        // Center and zoom map smoothly
-        mapInstanceRef.current.panTo(location);
-        mapInstanceRef.current.setZoom(14);
+        // Center and zoom map smoothly if map is available
+        if (mapInstanceRef.current) {
+          const location = { lat, lng };
+          mapInstanceRef.current.panTo(location);
+          mapInstanceRef.current.setZoom(14);
 
-        // Place custom marker
-        const { AdvancedMarkerElement } = (await importLibrary('marker')) as any;
-        if (pickedMarkerRef.current) {
-          pickedMarkerRef.current.position = location;
-          pickedMarkerRef.current.map = mapInstanceRef.current;
-        } else {
-          const pinContent = document.createElement('div');
-          pinContent.className = 'w-7 h-7 rounded-full bg-indigo-600 border-2 border-white shadow-xl flex items-center justify-center text-white';
-          pinContent.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3" fill="currentColor"/></svg>`;
+          // Place custom marker
+          try {
+            const { AdvancedMarkerElement } = (await importLibrary('marker')) as any;
+            if (pickedMarkerRef.current) {
+              pickedMarkerRef.current.position = location;
+              pickedMarkerRef.current.map = mapInstanceRef.current;
+            } else {
+              const pinContent = document.createElement('div');
+              pinContent.className = 'w-7 h-7 rounded-full bg-indigo-600 border-2 border-white shadow-xl flex items-center justify-center text-white';
+              pinContent.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3" fill="currentColor"/></svg>`;
 
-          pickedMarkerRef.current = new AdvancedMarkerElement({
-            position: location,
-            map: mapInstanceRef.current,
-            title: address,
-            content: pinContent,
-          });
+              pickedMarkerRef.current = new AdvancedMarkerElement({
+                position: location,
+                map: mapInstanceRef.current,
+                title: address,
+                content: pinContent,
+              });
+            }
+          } catch {
+            // Marker placement gracefully handled
+          }
         }
       } else {
-        setSearchFeedback('No matching location found. Try adding a city or country name.');
+        setSearchFeedback('No matching location found. You can enter coordinates (e.g., 37.77, -122.41) or a city name.');
       }
     } catch (err: any) {
-      console.warn('Geocoding search failed:', err);
-      setSearchFeedback('Location search failed. Check your query or network connection.');
+      console.warn('Location search issue:', err);
+      setSearchFeedback('Search failed. Try entering coordinates (e.g., 37.77, -122.41).');
     } finally {
       setIsSearching(false);
     }
@@ -420,18 +449,13 @@ export const JournalMapModal: React.FC<JournalMapModalProps> = ({
           mapInstanceRef.current.setZoom(15);
         }
 
-        // Reverse geocode to show address
-        if (geocoderRef.current) {
-          try {
-            const res = await geocoderRef.current.geocode({ location: latLng });
-            if (res.results && res.results[0]) {
-              setPickedLocation({ lat, lng, address: res.results[0].formatted_address });
-              setSearchFeedback(`Located: ${res.results[0].formatted_address}`);
-            }
-          } catch (e) {
-            // Ignored, coords already set
+        // Reverse geocode in background with fallback
+        reverseGeocodeCoordinate(lat, lng).then((address) => {
+          if (address) {
+            setPickedLocation({ lat, lng, address });
+            setSearchFeedback(`Located: ${address}`);
           }
-        }
+        });
       },
       (err) => {
         setIsLocatingUser(false);

@@ -155,7 +155,9 @@ gcloud secrets add-iam-policy-binding GEMINI_API_KEY \
 ### C. Google Maps JavaScript API Key (Client-Side HTTP Referrer Restricted)
 > **Security Notice**: Do **NOT** store the Google Maps JavaScript API Key in Secret Manager. Because it is executed in the user's browser, it must be bundled client-side via `VITE_GOOGLE_MAPS_API_KEY`.
 >
-> **Protection Mechanism**: Instead of secrecy, restrict the key in Google Cloud Console:
+> **Zero-Billing Architecture**: In ReflectAI, the Google Maps JavaScript API is loaded strictly for visual map rendering and custom pin placement (`maps` and `marker` libraries). Location searches and reverse geocoding are decoupled from Google's paid Geocoding API and proxied via same-origin backend endpoints (`/api/geo/*`), ensuring zero-billing prototyping without requiring an active billing account on Google Cloud.
+>
+> **Protection Mechanism**: Restrict the key in Google Cloud Console:
 > 1. Open **Google Cloud Console** > **APIs & Services** > **Credentials**.
 > 2. Edit your Maps API key under **Application restrictions**: select **Web sites** (HTTP referrers).
 > 3. Add authorized website referrers:
@@ -277,16 +279,24 @@ gcloud firestore indexes composite create \
 
 ## 5. Backend API Endpoints Reference
 
-All `/api/gemini/*` endpoints require a valid Firebase ID Token in the `Authorization: Bearer <idToken>` header, pass App Check validation, and enforce per-UID rate limits.
+All `/api/gemini/*` endpoints require a valid Firebase ID Token in the `Authorization: Bearer <idToken>` header, pass App Check validation, and enforce per-UID rate limits. Public `/api/geo/*` endpoints enforce per-IP rate limiting and strict parameter validation.
 
 | Method | Endpoint | Description | Key Payload Parameters |
 | :--- | :--- | :--- | :--- |
 | `GET` | `/api/health` | Health & service readiness check. | None |
+| `GET` | `/api/geo/search` | Zero-billing location search and coordinate parser (`lat, lng`). Queries OpenStreetMap Nominatim with server-side User-Agent, LRU caching, and timeout abort. | `q` (query string, max 150 chars, e.g. `Tokyo` or `37.77, -122.41`) |
+| `GET` | `/api/geo/reverse` | Zero-billing reverse geocoding resolving numeric coordinates to human-readable address. | `lat` (number, -90..90), `lng` (number, -180..180) |
 | `POST` | `/api/gemini/reflect` | Generates structured multi-turn reflection synthesis & takeaways. | `prompt` (string, max 2000), `mode` (`reflection` \| `brainstorm` \| `summary` \| `action_items` \| `chat`), `conversationHistory`, `tags`, `title` |
 | `POST` | `/api/gemini/summarize` | Distills entry into an executive summary & bullet highlights. | `text` (string, max 3000) |
 | `POST` | `/api/gemini/recommendations` | Analyzes caller's recent reflection themes & provides growth suggestions. | `clientReflections` (array of up to 10 entries) |
 | `POST` | `/api/gemini/embed-reflection` | Computes 768-dim vector embedding (`gemini-embedding-001`) for an entry. | `reflectionId` (string), `title` (string), `summary` (string) |
 | `POST` | `/api/gemini/search` | Performs KNN vector search & cosine ranking over user's journal vault. | `query` (string, max 500), `limit` (number, default 5), `clientEntries` (optional fallback array) |
+
+### Cloud Run Reverse Proxy & Rate Limiting (`trust proxy`)
+
+Google Cloud Run routes incoming requests through an ingress reverse proxy / load balancer that injects `X-Forwarded-For` and `Forwarded` headers. 
+- The Express application is configured with `app.set("trust proxy", 1)` to correctly recognize the single-hop reverse proxy and extract the real client IP.
+- Rate limiters configure `validate: { trustProxy: false, xForwardedForHeader: false, forwardedHeader: false }` to avoid unhandled validation exceptions while accurately enforcing per-IP and per-UID throttling limits across all public and authenticated endpoints.
 
 ---
 
@@ -356,10 +366,11 @@ ReflectAI operates across two distinct trust boundaries:
 | Threat Zone | Trust Boundary | Threat Scenario | Countermeasure Implemented |
 | :--- | :--- | :--- | :--- |
 | **Input Surfaces** | Boundary (a) | Prompt injection via past user reflection text; oversized payloads | Recommendation engine passes only reflection summaries/titles and explicitly instructs Gemini to treat entry content strictly as observational data to analyze, never executable instructions. Server enforces strict maximum character length limits (prompt ≤ 2000 chars, summarize ≤ 3000 chars) returning clean 400s. |
+| **Input Surfaces** | Boundary (a) | Reverse proxy header tampering, IP spoofing, or unhandled validation errors | Express configured with `trust proxy = 1` for Google Cloud Run's single ingress proxy hop. Rate limiters apply proxy-validated client IP extraction, preventing spoofing and avoiding unhandled Express `ValidationError` crashes. |
 | **Input Surfaces** | Boundary (b) | Malformed or malicious direct client document writes to Firestore | `firestore.rules` enforces schema validation, field types, and size caps directly on create/update operations, including numerical range checks on geo-coordinates (`-90..90`, `-180..180`). |
 | **Planning & Reasoning** | Boundary (a) | System prompt hijacking, model hallucinated links, or API outages | Recommendations response schema enforces structured JSON output with a curated developer allowlist for external resources (rejecting arbitrary hallucinated URLs). Resilient fallback ladder handles transient 503/429/404/500 errors gracefully. |
-| **Tool Execution** | Boundary (a) | API key compromise, SSRF, or unauthorized third-party access | Gemini API key is isolated in Secret Manager and accessible only by the dedicated `reflect-ai-runner` service account. Google Maps JavaScript API key is restricted by HTTP Referrer in Google Cloud Console. |
+| **Tool Execution** | Boundary (a) | API key compromise, SSRF, or unauthorized third-party access | Gemini API key is isolated in Secret Manager and accessible only by the dedicated `reflect-ai-runner` service account. Google Maps JavaScript API key is restricted by HTTP Referrer in Google Cloud Console. Location search is decoupled to a server-side proxy with strict query length validation and abort timeouts. |
 | **Memory & State** | Boundary (a) | Cross-user data leakage, missing auth on AI endpoints | Firebase Admin SDK verifies Bearer ID tokens on `/api/gemini/*` endpoints before reading reflection history. Guest users are prevented from invoking server recommendation summaries. In-memory per-UID rate limiting prevents unbounded AI consumption. |
 | **Memory & State** | Boundary (b) | Unauthorized direct Firestore read/write or token replay | Owner-bound Firestore rules isolate `reflections` and `recommendations` subcollections (`request.auth.uid == userId`). Firebase App Check with reCAPTCHA v3 enforces that direct Firestore writes originate from the authentic web application. |
-| **Inter-System Comms** | Boundary (a) & (b) | Insecure token transmission, coordinate precision re-identification | All backend communications require verified HTTPS Firebase ID tokens. Geolocation is an explicit opt-in toggle (never silent) rounded to safe precision. Explicit CORS and Helmet CSP headers restrict network interactions. |
+| **Inter-System Comms** | Boundary (a) & (b) | Insecure token transmission, coordinate precision re-identification, billing lockout | All backend communications require verified HTTPS Firebase ID tokens. Geolocation is an explicit opt-in toggle (never silent) rounded to safe precision. Google Geocoding dependency eliminated; visual maps use JS API while searches are handled by `/api/geo/*` without billing dependencies. Explicit CORS and Helmet CSP headers restrict network interactions. |
 | **Recommendation & Search Generation** | Boundary (a) | Cross-user vector search leakage, raw embedding exposure, unauthenticated cost exhaustion | Similarity search (`POST /api/gemini/search`) queries are strictly scoped to `users/{uid}/reflections` (never collection-group queries spanning users). Embeddings are generated only on title+summary (never full raw message trees) and stripped from API responses, returning only sanitized `{ id, title, summary, score }`. Guest mode completely bypasses billable embedding endpoints. |

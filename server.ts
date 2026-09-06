@@ -4,7 +4,7 @@ import fs from "fs";
 import dotenv from "dotenv";
 import helmet from "helmet";
 import cors from "cors";
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import { initializeApp, getApps, App } from "firebase-admin/app";
@@ -159,6 +159,9 @@ const CURATED_RESOURCE_ALLOWLIST = [
 const app = express();
 const PORT = 3000;
 
+// Trust reverse proxy hops (Cloud Run / Nginx front-end load balancer)
+app.set("trust proxy", 1);
+
 // 1. Mandatory Top-Level Request Deserialization (Ordering Guarantee)
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
@@ -280,6 +283,11 @@ const publicIpLimiter = rateLimit({
   max: 60, // 60 requests per minute per IP
   standardHeaders: true,
   legacyHeaders: false,
+  validate: {
+    trustProxy: false,
+    xForwardedForHeader: false,
+    forwardedHeader: false,
+  },
   message: { error: "Too many requests to health endpoint. Please wait a moment." },
 });
 
@@ -289,7 +297,16 @@ const authenticatedGeminiLimiter = rateLimit({
   max: 30, // 30 AI generations per minute per user
   keyGenerator: (req: Request) => {
     const authReq = req as AuthenticatedRequest;
-    return authReq.user?.uid || req.ip || "anonymous";
+    if (authReq.user?.uid) {
+      return authReq.user.uid;
+    }
+    return ipKeyGenerator(req.ip || "127.0.0.1");
+  },
+  validate: {
+    trustProxy: false,
+    xForwardedForHeader: false,
+    forwardedHeader: false,
+    keyGeneratorIpFallback: false,
   },
   standardHeaders: true,
   legacyHeaders: false,
@@ -501,6 +518,10 @@ function cosineSimilarity(vecA: number[], vecB: number[]): number {
 // API Endpoints
 // -------------------------------------------------------------
 
+// Geolocation Caches for fast response and external rate-protection
+const geoSearchCache = new Map<string, any[]>();
+const geoReverseCache = new Map<string, string>();
+
 // Health check (light per-IP rate limiting)
 app.get("/api/health", publicIpLimiter, (_req: Request, res: Response) => {
   res.json({
@@ -508,6 +529,141 @@ app.get("/api/health", publicIpLimiter, (_req: Request, res: Response) => {
     timestamp: new Date().toISOString(),
     geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
   });
+});
+
+// Resilient Geo Search Endpoint (Zero-Billing OpenStreetMap proxy with coordinate support)
+app.get("/api/geo/search", publicIpLimiter, async (req: Request, res: Response) => {
+  const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  if (!query) {
+    return res.status(400).json({ error: "Query parameter 'q' is required." });
+  }
+
+  // Explicit maximum character length (OWASP input validation)
+  if (query.length > 150) {
+    return res.status(400).json({ error: "Query exceeds maximum limit of 150 characters." });
+  }
+
+  // 1. Direct coordinate pattern parsing: "37.77, -122.41"
+  const coordMatch = query.match(/^(-?\d+(\.\d+)?)[,\s]+(-?\d+(\.\d+)?)$/);
+  if (coordMatch) {
+    const lat = Number(parseFloat(coordMatch[1]).toFixed(4));
+    const lng = Number(parseFloat(coordMatch[3]).toFixed(4));
+    if (lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+      return res.json({
+        results: [
+          {
+            lat,
+            lng,
+            displayName: `Coordinates (${lat}°, ${lng}°)`,
+            address: `${lat}, ${lng}`,
+          },
+        ],
+      });
+    }
+  }
+
+  // 2. Cache lookup
+  const cacheKey = query.toLowerCase();
+  if (geoSearchCache.has(cacheKey)) {
+    return res.json({ results: geoSearchCache.get(cacheKey) });
+  }
+
+  // 3. Query OpenStreetMap Nominatim with compliant server-side User-Agent
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 4500);
+    const nominatimUrl = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=5`;
+    const response = await fetch(nominatimUrl, {
+      headers: {
+        "User-Agent": "ReflectAI-JournalApp/1.0 (academic-prototype@reflectai.internal)",
+        Accept: "application/json",
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      return res.json({ results: [] });
+    }
+
+    const data = (await response.json()) as any[];
+    const results = Array.isArray(data)
+      ? data.map((item) => ({
+          lat: Number(parseFloat(item.lat).toFixed(4)),
+          lng: Number(parseFloat(item.lon).toFixed(4)),
+          displayName: item.display_name || `${item.lat}, ${item.lon}`,
+          address: item.display_name || `${item.lat}, ${item.lon}`,
+        }))
+      : [];
+
+    if (geoSearchCache.size > 500) {
+      geoSearchCache.clear();
+    }
+    geoSearchCache.set(cacheKey, results);
+
+    return res.json({ results });
+  } catch (err) {
+    console.warn("Geo search issue:", err);
+    return res.json({ results: [] });
+  }
+});
+
+// Resilient Geo Reverse Endpoint (Zero-Billing reverse geocoding)
+app.get("/api/geo/reverse", publicIpLimiter, async (req: Request, res: Response) => {
+  const latNum = parseFloat(String(req.query.lat));
+  const lngNum = parseFloat(String(req.query.lng));
+
+  // Numeric bounds check: lat -90..90, lng -180..180
+  if (
+    isNaN(latNum) ||
+    isNaN(lngNum) ||
+    latNum < -90 ||
+    latNum > 90 ||
+    lngNum < -180 ||
+    lngNum > 180
+  ) {
+    return res.status(400).json({
+      error: "Valid numeric 'lat' (-90..90) and 'lng' (-180..180) coordinates are required.",
+    });
+  }
+
+  const lat = Number(latNum.toFixed(4));
+  const lng = Number(lngNum.toFixed(4));
+  const cacheKey = `${lat},${lng}`;
+
+  if (geoReverseCache.has(cacheKey)) {
+    return res.json({ address: geoReverseCache.get(cacheKey) });
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 4500);
+    const nominatimUrl = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`;
+    const response = await fetch(nominatimUrl, {
+      headers: {
+        "User-Agent": "ReflectAI-JournalApp/1.0 (academic-prototype@reflectai.internal)",
+        Accept: "application/json",
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      return res.json({ address: `${lat}°, ${lng}°` });
+    }
+
+    const data = (await response.json()) as any;
+    const address = data?.display_name || `${lat}°, ${lng}°`;
+
+    if (geoReverseCache.size > 500) {
+      geoReverseCache.clear();
+    }
+    geoReverseCache.set(cacheKey, address);
+
+    return res.json({ address });
+  } catch (err) {
+    return res.json({ address: `${lat}°, ${lng}°` });
+  }
 });
 
 // Reflection & Multi-Turn Journal Endpoint (Authenticated + App Check + per-UID rate limited)
