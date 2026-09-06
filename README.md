@@ -201,17 +201,19 @@ firebase deploy --only firestore:rules
 
 Feature 3 implements semantic similarity search across reflections using Gemini 768-dimensional embeddings (`gemini-embedding-001`) and Cloud Firestore's native K-Nearest Neighbor (KNN) `findNearest` vector queries.
 
-To activate native Firestore vector acceleration, execute the following `gcloud` command once in your Google Cloud environment:
+In this project, Firestore is provisioned on database ID `ai-studio-d3fee594-9314-471a-9b0d-2a2808c4182d` (rather than the `(default)` database). Therefore, you must pass the `--database` flag to `gcloud firestore`:
 
 ```bash
 # Create the composite vector index for the reflections subcollection
 gcloud firestore indexes composite create \
+  --project=ai-agent-coffee-mgr-30-08-26 \
+  --database=ai-studio-d3fee594-9314-471a-9b0d-2a2808c4182d \
   --collection-group=reflections \
   --query-scope=COLLECTION \
   --field-config field-path=embedding,vector-config='{"dimension":"768","flat":"{}"}'
 ```
 
-*(Note: While this index is building, the backend gracefully provides in-memory cosine similarity and keyword matching across the user's isolated vault so search remains functional without interruption).*
+*(Note: While this index is building, the backend automatically provides in-memory cosine similarity and keyword matching across the user's isolated vault so search remains functional without interruption).*
 
 ---
 

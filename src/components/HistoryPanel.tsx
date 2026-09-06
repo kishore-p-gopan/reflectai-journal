@@ -68,7 +68,7 @@ export const HistoryPanel: React.FC<HistoryPanelProps> = ({
     setIndexNotice(null);
 
     try {
-      const result = await searchReflectionsSemantically(searchQuery.trim(), 8);
+      const result = await searchReflectionsSemantically(searchQuery.trim(), entries, 8);
       setSemanticMatches(result.matches);
       if (result.indexRequired && result.indexNotice) {
         setIndexNotice(result.indexNotice);

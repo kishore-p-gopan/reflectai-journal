@@ -246,14 +246,14 @@ export async function saveReflectionToFirestore(
     const cleanPayload = sanitizeForFirestore(payload);
     await setDoc(docRef, cleanPayload, { merge: true });
 
-    // Feature 3: Asynchronously generate and persist vector embedding on server for authenticated users
+    // Feature 3: Asynchronously generate and persist vector embedding on server/client for authenticated users
     if (!userId.startsWith('guest_') && (payload.title || payload.summary || payload.primaryPrompt)) {
       (async () => {
         try {
           const currentUser = auth.currentUser;
           if (currentUser) {
             const token = await currentUser.getIdToken();
-            await fetch('/api/gemini/embed-reflection', {
+            const res = await fetch('/api/gemini/embed-reflection', {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
@@ -265,6 +265,20 @@ export async function saveReflectionToFirestore(
                 summary: payload.summary || payload.primaryPrompt?.slice(0, 300),
               }),
             });
+            if (res.ok) {
+              const data = await res.json();
+              if (data.embedding && !data.serverSaved) {
+                // Client-side direct write using Firebase Web SDK (Boundary b)
+                await setDoc(
+                  docRef,
+                  {
+                    embedding: data.embedding,
+                    embeddingUpdatedAt: Date.now(),
+                  },
+                  { merge: true }
+                );
+              }
+            }
           }
         } catch (embedErr) {
           // Non-blocking: background embedding generation error should never prevent or reject the save
@@ -432,7 +446,8 @@ export interface SemanticSearchResult {
 
 export async function searchReflectionsSemantically(
   query: string,
-  limit = 5
+  clientEntries: ReflectionEntry[] = [],
+  limit = 8
 ): Promise<SemanticSearchResult> {
   const currentUser = auth.currentUser;
   if (!currentUser) {
@@ -440,6 +455,15 @@ export async function searchReflectionsSemantically(
   }
 
   const token = await currentUser.getIdToken();
+  const serializedEntries = clientEntries.map((e) => ({
+    id: e.id,
+    title: e.title,
+    summary: e.summary || (e.primaryPrompt ? e.primaryPrompt.slice(0, 300) : ''),
+    primaryPrompt: e.primaryPrompt ? e.primaryPrompt.slice(0, 600) : '',
+    tags: Array.isArray(e.tags) ? e.tags.slice(0, 5) : [],
+    embedding: e.embedding,
+  }));
+
   const res = await fetch('/api/gemini/search', {
     method: 'POST',
     headers: {
@@ -449,6 +473,7 @@ export async function searchReflectionsSemantically(
     body: JSON.stringify({
       query: query.trim(),
       limit,
+      clientEntries: serializedEntries,
     }),
   });
 

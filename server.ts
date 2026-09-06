@@ -741,46 +741,22 @@ app.post(
 
     const clientProvided = Array.isArray(body.clientReflections) ? body.clientReflections : [];
 
-    // Feature 3: Optionally prioritize semantically relevant reflections using findNearest on activeReflectionId
+    // Feature 3: Prioritize reflections passed by client (Boundary b: reflections are read directly from Firestore via Firebase Web SDK)
     let recentReflections: Array<{ title: string; summary: string; promptSnippet: string; tags: string[]; mode: string }> = [];
-    const db = getFirestore(adminApp, firestoreDatabaseId);
 
-    if (typeof body.activeReflectionId === "string" && body.activeReflectionId.length <= 128) {
+    if (clientProvided.length > 0) {
+      recentReflections = clientProvided.slice(0, 5).map((d: any) => ({
+        title: (typeof d?.title === "string" ? d.title : "Untitled Thought").slice(0, 60),
+        summary: (typeof d?.summary === "string" ? d.summary : "").slice(0, 140),
+        promptSnippet: (typeof d?.primaryPrompt === "string" ? d.primaryPrompt : "").slice(0, 140),
+        tags: Array.isArray(d?.tags) ? d.tags.slice(0, 4) : [],
+        mode: typeof d?.mode === "string" ? d.mode : "reflection",
+      }));
+    } else {
+      // Fallback: only attempt server-side Firestore read if client provided 0 reflections
       try {
-        const activeDocSnap = await db.collection("users").doc(uid).collection("reflections").doc(body.activeReflectionId).get();
-        const activeData = activeDocSnap.data();
-        if (activeData && activeData.embedding) {
-          const nearestSnap = await db.collection("users").doc(uid).collection("reflections").findNearest({
-            vectorField: "embedding",
-            queryVector: activeData.embedding,
-            limit: 6,
-            distanceMeasure: "COSINE",
-          }).get();
-
-          const relatedDocs = nearestSnap.docs
-            .filter((d) => d.id !== body.activeReflectionId)
-            .slice(0, 5)
-            .map((d) => d.data());
-
-          if (relatedDocs.length > 0) {
-            recentReflections = relatedDocs.map((d) => ({
-              title: (typeof d.title === "string" ? d.title : "Untitled Thought").slice(0, 60),
-              summary: (typeof d.summary === "string" ? d.summary : "").slice(0, 140),
-              promptSnippet: (typeof d.primaryPrompt === "string" ? d.primaryPrompt : "").slice(0, 140),
-              tags: Array.isArray(d.tags) ? d.tags.slice(0, 4) : [],
-              mode: typeof d.mode === "string" ? d.mode : "reflection",
-            }));
-          }
-        }
-      } catch (knnErr) {
-        console.warn("Nearest semantic reflections lookup notice (falling back to recency):", knnErr);
-      }
-    }
-
-    // If semantic lookup did not populate, retrieve user's last 5 reflections by recency directly from Firestore by UID
-    if (recentReflections.length === 0) {
-      try {
-        const snap = await db.collection("users").doc(uid).collection("reflections").limit(10).get();
+        const db = getFirestore(adminApp, firestoreDatabaseId);
+        const snap = await db.collection("users").doc(uid).collection("reflections").limit(5).get();
         const docs = snap.docs.map((doc) => doc.data());
         docs.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
         recentReflections = docs.slice(0, 5).map((d) => ({
@@ -790,21 +766,10 @@ app.post(
           tags: Array.isArray(d.tags) ? d.tags.slice(0, 4) : [],
           mode: typeof d.mode === "string" ? d.mode : "reflection",
         }));
-      } catch (dbErr: any) {
-        console.warn("Server Firestore reflection query notice:", dbErr?.message || dbErr);
+      } catch {
+        // Non-blocking: in client-direct Firestore architecture, server-side direct DB access is optional
       }
     }
-
-  // If server DB had 0 entries or empty text, hydrate from client-provided reflections
-  if (recentReflections.length === 0 && clientProvided.length > 0) {
-    recentReflections = clientProvided.slice(0, 5).map((d: any) => ({
-      title: (typeof d?.title === "string" ? d.title : "Untitled Thought").slice(0, 60),
-      summary: (typeof d?.summary === "string" ? d.summary : "").slice(0, 140),
-      promptSnippet: (typeof d?.primaryPrompt === "string" ? d.primaryPrompt : "").slice(0, 140),
-      tags: Array.isArray(d?.tags) ? d.tags.slice(0, 4) : [],
-      mode: typeof d?.mode === "string" ? d.mode : "reflection",
-    }));
-  }
 
   const systemInstruction = `You are ReflectAI's thoughtful reflection and personal growth guide.
 IMPORTANT SECURITY & DEFENSE BOUNDARY (OWASP LLM01):
@@ -957,8 +922,8 @@ Always output structured JSON conforming strictly to the provided schema with:
   try {
     const db = getFirestore(adminApp, firestoreDatabaseId);
     await db.collection("users").doc(uid).collection("recommendations").doc(recId).set(batch);
-  } catch (saveErr: any) {
-    console.warn("Failed to persist recommendations to Firestore on server:", saveErr?.message || saveErr);
+  } catch {
+    // Non-blocking: client persists directly to Firestore via Firebase Web SDK
   }
 
   return res.json(batch);
@@ -998,30 +963,38 @@ app.post(
     try {
       // Bounded embedding generation via gemini-embedding-001 (768 dimensions)
       const vectorValues = await embedContentWithFallback(textToEmbed, 768);
-      const vector = FieldValue.vector(vectorValues);
 
-      const db = getFirestore(adminApp, firestoreDatabaseId);
-      // Store strictly isolated on users/{uid}/reflections/{reflectionId}
-      await db
-        .collection("users")
-        .doc(uid)
-        .collection("reflections")
-        .doc(reflectionId)
-        .set(
-          {
-            embedding: vector,
-            embeddingUpdatedAt: Date.now(),
-          },
-          { merge: true }
-        );
+      let serverSaved = false;
+      try {
+        const vector = FieldValue.vector(vectorValues);
+        const db = getFirestore(adminApp, firestoreDatabaseId);
+        // Store strictly isolated on users/{uid}/reflections/{reflectionId}
+        await db
+          .collection("users")
+          .doc(uid)
+          .collection("reflections")
+          .doc(reflectionId)
+          .set(
+            {
+              embedding: vector,
+              embeddingUpdatedAt: Date.now(),
+            },
+            { merge: true }
+          );
+        serverSaved = true;
+      } catch {
+        // Non-blocking: If server lacks direct Firestore credentials, client persists embedding directly
+      }
 
       return res.json({
         success: true,
         reflectionId,
         dimensions: vectorValues.length,
+        embedding: vectorValues,
+        serverSaved,
       });
     } catch (err: any) {
-      console.error("Error generating or saving reflection embedding:", err?.message || err);
+      console.error("Error generating reflection embedding:", err?.message || err);
       return res.status(500).json({
         error: "Failed to generate reflection vector embedding.",
         details: err?.message || String(err),
@@ -1054,59 +1027,112 @@ app.post(
     // OWASP LLM10 / Unbounded Consumption: maximum 500 characters on incoming query
     const query = rawQuery.trim().slice(0, 500);
     const limit = typeof body.limit === "number" && body.limit > 0 && body.limit <= 20 ? Math.floor(body.limit) : 5;
+    const clientEntries = Array.isArray(body.clientEntries) ? body.clientEntries : [];
 
     try {
       // 1. Generate query embedding using gemini-embedding-001 fallback ladder (768 dims)
       const queryVectorValues = await embedContentWithFallback(query, 768);
-      const queryVector = FieldValue.vector(queryVectorValues);
-
-      const db = getFirestore(adminApp, firestoreDatabaseId);
-      // STRICT DATA ISOLATION: Scoped purely to the caller's own subcollection users/{uid}/reflections
-      // (NEVER a collectionGroup query that could span other users)
-      const reflectionsCol = db.collection("users").doc(uid).collection("reflections");
 
       let matches: Array<{ id: string; title: string; summary: string; score: number }> = [];
       let indexRequired = false;
       let indexNotice = "";
 
-      try {
-        // Native Firestore findNearest KNN Vector Search
-        const vectorQuery = reflectionsCol.findNearest({
-          vectorField: "embedding",
-          queryVector,
-          limit,
-          distanceMeasure: "COSINE",
-          distanceResultField: "distance",
-        });
+      // Prioritize client-provided entries (Boundary b: client reads directly from Firestore via Firebase Web SDK)
+      if (clientEntries.length > 0) {
+        const scoredDocs: Array<{ id: string; title: string; summary: string; score: number }> = [];
 
-        const snapshot = await vectorQuery.get();
-        matches = snapshot.docs.map((docSnap) => {
-          const data = docSnap.data();
-          const distance = typeof data.distance === "number" ? data.distance : (docSnap.get("distance") ?? 0.5);
-          // Convert Cosine distance [0..2] to normalized similarity score [0..1]
-          const score = Math.max(0, Math.min(1, Math.round((1 - distance / 2) * 100) / 100));
+        for (const item of clientEntries) {
+          if (!item || typeof item !== "object" || typeof item.id !== "string") continue;
+          let score = 0;
+          let vec =
+            Array.isArray(item.embedding) && item.embedding.length > 0
+              ? item.embedding
+              : item.embedding && Array.isArray((item.embedding as any).values)
+              ? (item.embedding as any).values
+              : item.embedding && Array.isArray((item.embedding as any)._values)
+              ? (item.embedding as any)._values
+              : null;
 
-          return {
-            id: docSnap.id,
-            title: typeof data.title === "string" ? data.title : "Untitled Reflection",
-            summary: typeof data.summary === "string" ? data.summary : (typeof data.primaryPrompt === "string" ? data.primaryPrompt.slice(0, 150) : ""),
-            score,
-          };
-        });
-      } catch (vectorErr: any) {
-        const errMsg = String(vectorErr?.message || vectorErr);
-        const isPrecondition =
-          vectorErr?.code === 9 ||
-          errMsg.toLowerCase().includes("vector index") ||
-          errMsg.toLowerCase().includes("failed_precondition");
+          // If no embedding was pre-computed or stored on the document, compute dynamically
+          if (!vec) {
+            const textToEmbed = `${item.title || ""} ${item.summary || ""} ${item.primaryPrompt || ""}`.trim().slice(0, 1500);
+            if (textToEmbed) {
+              try {
+                vec = await embedContentWithFallback(textToEmbed, 768);
+              } catch (embErr) {
+                console.warn("On-the-fly embedding notice:", embErr);
+              }
+            }
+          }
 
-        if (isPrecondition) {
-          indexRequired = true;
-          indexNotice = "A composite vector index on collection 'reflections' field 'embedding' is required for native Firestore KNN queries. Execute `gcloud firestore indexes composite create` to activate native acceleration.";
-          console.warn("Firestore findNearest vector index notice:", errMsg);
+          if (vec) {
+            score = cosineSimilarity(queryVectorValues, vec);
+          } else {
+            // Token overlap fallback
+            const docText = `${item.title || ""} ${item.summary || ""} ${item.primaryPrompt || ""}`.toLowerCase();
+            const qTokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+            const matchedTokens = qTokens.filter((token) => docText.includes(token));
+            score = qTokens.length > 0 ? (matchedTokens.length / qTokens.length) * 0.7 : 0;
+          }
 
-          // Graceful In-Memory Semantic / Cosine Fallback across user's existing reflections
+          if (score > 0.05) {
+            scoredDocs.push({
+              id: item.id,
+              title: typeof item.title === "string" ? item.title : "Untitled Reflection",
+              summary: (typeof item.summary === "string" && item.summary) ? item.summary : (typeof item.primaryPrompt === "string" ? item.primaryPrompt.slice(0, 140) : ""),
+              score: Math.round(score * 100) / 100,
+            });
+          }
+        }
+
+        scoredDocs.sort((a, b) => b.score - a.score);
+        matches = scoredDocs.slice(0, limit);
+        console.log(`[Semantic Search] Evaluated ${clientEntries.length} client entries for user ${uid}. Matches found: ${matches.length}`);
+      } else {
+        // Attempt native Firestore findNearest KNN Vector Search
+        try {
+          const queryVector = FieldValue.vector(queryVectorValues);
+          const db = getFirestore(adminApp, firestoreDatabaseId);
+          const reflectionsCol = db.collection("users").doc(uid).collection("reflections");
+
+          const vectorQuery = reflectionsCol.findNearest({
+            vectorField: "embedding",
+            queryVector,
+            limit,
+            distanceMeasure: "COSINE",
+            distanceResultField: "distance",
+          });
+
+          const snapshot = await vectorQuery.get();
+          matches = snapshot.docs.map((docSnap) => {
+            const data = docSnap.data();
+            const distance = typeof data.distance === "number" ? data.distance : (docSnap.get("distance") ?? 0.5);
+            // Convert Cosine distance [0..2] to normalized similarity score [0..1]
+            const score = Math.max(0, Math.min(1, Math.round((1 - distance / 2) * 100) / 100));
+
+            return {
+              id: docSnap.id,
+              title: typeof data.title === "string" ? data.title : "Untitled Reflection",
+              summary: typeof data.summary === "string" ? data.summary : (typeof data.primaryPrompt === "string" ? data.primaryPrompt.slice(0, 150) : ""),
+              score,
+            };
+          });
+        } catch (vectorErr: any) {
+          const errMsg = String(vectorErr?.message || vectorErr);
+          const isPrecondition =
+            vectorErr?.code === 9 ||
+            errMsg.toLowerCase().includes("vector index") ||
+            errMsg.toLowerCase().includes("failed_precondition");
+
+          if (isPrecondition) {
+            indexRequired = true;
+            indexNotice = "A composite vector index on collection 'reflections' field 'embedding' is required for native Firestore KNN queries. Run `gcloud firestore indexes composite create --database=ai-studio-d3fee594-9314-471a-9b0d-2a2808c4182d --collection-group=reflections --query-scope=COLLECTION --field-config field-path=embedding,vector-config='{\"dimension\":\"768\",\"flat\":\"{}\"}'` to activate native acceleration.";
+          }
+
+          // Graceful In-Memory Semantic / Cosine Fallback across user's existing reflections if server has DB access
           try {
+            const db = getFirestore(adminApp, firestoreDatabaseId);
+            const reflectionsCol = db.collection("users").doc(uid).collection("reflections");
             const allUserDocsSnap = await reflectionsCol.limit(50).get();
             const scoredDocs: Array<{ id: string; title: string; summary: string; score: number }> = [];
 
@@ -1114,7 +1140,6 @@ app.post(
               const data = docSnap.data();
               let score = 0;
 
-              // Check if embedding exists on document
               const docEmbedding = data.embedding;
               const vec =
                 docEmbedding && Array.isArray((docEmbedding as any).values)
@@ -1128,7 +1153,6 @@ app.post(
               if (vec) {
                 score = cosineSimilarity(queryVectorValues, vec);
               } else {
-                // Keyword overlap fallback
                 const docText = `${data.title || ""} ${data.summary || ""} ${data.primaryPrompt || ""}`.toLowerCase();
                 const qTokens = query.toLowerCase().split(/\s+/).filter(Boolean);
                 const matchedTokens = qTokens.filter((token) => docText.includes(token));
@@ -1147,11 +1171,9 @@ app.post(
 
             scoredDocs.sort((a, b) => b.score - a.score);
             matches = scoredDocs.slice(0, limit);
-          } catch (scanErr) {
-            console.warn("In-memory fallback search scan notice:", scanErr);
+          } catch {
+            // Non-blocking: Server lacks direct Firestore read permissions in this container environment
           }
-        } else {
-          throw vectorErr;
         }
       }
 
