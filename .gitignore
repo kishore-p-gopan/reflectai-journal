@@ -1,0 +1,17 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Local credentials, platform secrets, and tokens
+firebase-applet-config.json
+firebase_applet_config.xml
+service-account*.json
+serviceAccount*.json
+*credentials*.json
+*.pem
+*.key

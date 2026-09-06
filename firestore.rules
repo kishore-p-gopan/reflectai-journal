@@ -1,0 +1,71 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Authorization helpers
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Geo-coordinate validation (-90..90 lat, -180..180 lng)
+    function isValidGeo(geo) {
+      return geo == null || (
+        geo is map
+        && geo.lat is number
+        && geo.lng is number
+        && geo.lat >= -90
+        && geo.lat <= 90
+        && geo.lng >= -180
+        && geo.lng <= 180
+      );
+    }
+
+    // Schema and length validation for reflections
+    function isValidReflection(data, userId) {
+      return data.id is string && data.id.size() > 0 && data.id.size() <= 128
+        && data.userId == userId
+        && data.title is string && data.title.size() <= 300
+        && data.createdAt is number
+        && data.updatedAt is number
+        && (!('primaryPrompt' in data) || (data.primaryPrompt is string && data.primaryPrompt.size() <= 5000))
+        && (!('summary' in data) || (data.summary is string && data.summary.size() <= 5000))
+        && (!('mode' in data) || (data.mode is string && data.mode.size() <= 50))
+        && (!('pinned' in data) || data.pinned is bool)
+        && (!('tags' in data) || data.tags is list)
+        && (!('takeaways' in data) || data.takeaways is list)
+        && (!('messages' in data) || data.messages is list)
+        && (!('geo' in data) || isValidGeo(data.geo))
+        && (!('embedding' in data) || true)
+        && (!('embeddingUpdatedAt' in data) || data.embeddingUpdatedAt is number);
+    }
+
+    // Schema validation for recommendation batches
+    function isValidRecommendationBatch(data, userId) {
+      return data.id is string && data.id.size() > 0 && data.id.size() <= 128
+        && data.userId == userId
+        && data.suggestions is list
+        && data.createdAt is number;
+    }
+
+    // User-isolated reflections: schema-validated and owner-bound
+    match /users/{userId}/reflections/{reflectionId} {
+      allow read, delete: if isOwner(userId);
+      allow create, update: if isOwner(userId) && isValidReflection(request.resource.data, userId);
+    }
+
+    // User-isolated recommendations: schema-validated and owner-bound
+    match /users/{userId}/recommendations/{recId} {
+      allow read, delete: if isOwner(userId);
+      allow create, update: if isOwner(userId) && isValidRecommendationBatch(request.resource.data, userId);
+    }
+  }
+}
+

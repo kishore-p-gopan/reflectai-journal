@@ -1,0 +1,118 @@
+{
+  "entities": {
+    "ReflectionEntry": {
+      "title": "ReflectionEntry",
+      "description": "User journal reflection thread with multi-turn messages, takeaways, and tags",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique reflection identifier"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner user ID"
+        },
+        "title": {
+          "type": "string",
+          "description": "Title of the reflection"
+        },
+        "primaryPrompt": {
+          "type": "string",
+          "description": "Original prompt or thought submitted by user"
+        },
+        "summary": {
+          "type": "string",
+          "description": "AI generated concise summary"
+        },
+        "takeaways": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Key takeaways extracted from the reflection"
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "role": { "type": "string" },
+              "content": { "type": "string" },
+              "timestamp": { "type": "string" },
+              "mode": { "type": "string" },
+              "takeaways": { "type": "array", "items": { "type": "string" } },
+              "suggestedQuestions": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["id", "role", "content", "timestamp"]
+          },
+          "description": "Multi-turn reflection conversation messages"
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Thematic tags"
+        },
+        "geo": {
+          "type": "object",
+          "properties": {
+            "lat": { "type": "number", "minimum": -90, "maximum": 90 },
+            "lng": { "type": "number", "minimum": -180, "maximum": 180 }
+          },
+          "required": ["lat", "lng"],
+          "description": "Optional geographic coordinates of the reflection"
+        },
+        "mode": {
+          "type": "string",
+          "description": "Reflection mode"
+        },
+        "pinned": {
+          "type": "boolean",
+          "description": "Whether reflection is pinned to top of history"
+        },
+        "createdAt": {
+          "type": "number",
+          "description": "Creation timestamp in milliseconds"
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Last update timestamp in milliseconds"
+        }
+      },
+      "required": ["id", "userId", "title", "createdAt", "updatedAt"]
+    },
+    "RecommendationBatch": {
+      "title": "RecommendationBatch",
+      "description": "AI-generated personalized wellbeing suggestions and reflective practices",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique batch identifier" },
+        "userId": { "type": "string", "description": "Owner user ID" },
+        "suggestions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": { "type": "string" },
+              "reason": { "type": "string" },
+              "category": { "type": "string" },
+              "resourceLink": { "type": "string" }
+            },
+            "required": ["title", "reason", "category"]
+          }
+        },
+        "createdAt": { "type": "number", "description": "Creation timestamp in milliseconds" }
+      },
+      "required": ["id", "userId", "suggestions", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/reflections/{reflectionId}": {
+      "schema": "ReflectionEntry",
+      "description": "Owner-isolated reflections collection"
+    },
+    "/users/{userId}/recommendations/{recId}": {
+      "schema": "RecommendationBatch",
+      "description": "Owner-isolated recommendation batches"
+    }
+  }
+}

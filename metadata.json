@@ -1,0 +1,6 @@
+{
+  "name": "ReflectAI - Journal & Reflection Assistant",
+  "description": "User-authenticated AI journaling & reflection workspace powered by Gemini API and Cloud Firestore with secure multi-turn conversations and automated synthesis.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
